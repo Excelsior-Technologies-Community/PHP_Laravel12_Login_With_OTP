@@ -6,132 +6,187 @@ use App\Http\Controllers\Controller;
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\DB;
 use Carbon\Carbon;
-use Twilio\Rest\Client;
 
-// Controller responsible for registration, login, and OTP verification
 class AuthController extends Controller
 {
     /**
-     * REGISTER USER (NO OTP REQUIRED)
-     * Stores user details with encrypted password
+     * REGISTER (mobile-based)
      */
     public function register(Request $request)
     {
-        // Validate incoming request data
         $request->validate([
-            'name' => 'required|string',
+            'name' => 'required',
             'mobile' => 'required|digits:10|unique:users,mobile',
-            'password' => 'required|min:6',
         ]);
 
-        // Create a new user record
-        User::create([
+        $user = User::create([
             'name' => $request->name,
             'mobile' => $request->mobile,
-            'password' => Hash::make($request->password), // Encrypt password
+            'password' => Hash::make('123456'), // default password
         ]);
 
-        // Return success response
         return response()->json([
-            'status' => true,
-            'message' => 'Registration successful'
+            'message' => 'User registered successfully',
+            'user' => $user
         ]);
     }
 
     /**
-     * LOGIN → GENERATE & SEND OTP VIA SMS
-     * Validates credentials and sends OTP to user mobile number
+     * LOGIN → SEND OTP
      */
     public function login(Request $request)
     {
-        // Validate login inputs
         $request->validate([
             'mobile' => 'required|digits:10',
-            'password' => 'required',
         ]);
 
-        // Fetch user using mobile number
         $user = User::where('mobile', $request->mobile)->first();
 
-        // Check if user exists and password matches
-        if (!$user || !Hash::check($request->password, $user->password)) {
+        if (!$user) {
             return response()->json([
                 'status' => false,
-                'message' => 'Invalid credentials'
-            ], 401);
+                'message' => 'Mobile number not registered'
+            ], 404);
         }
 
-        // Generate a random 6-digit OTP
+        // Generate OTP
         $otp = rand(100000, 999999);
 
-        // Save OTP and expiry time in database
         $user->update([
             'otp' => $otp,
             'otp_expires_at' => Carbon::now()->addMinutes(5),
+            'otp_attempts' => 0
         ]);
 
-        // Send OTP via Twilio SMS
-        try {
-            $twilio = new Client(env('TWILIO_SID'), env('TWILIO_AUTH_TOKEN'));
-            $twilio->messages->create(
-                '+91' . $user->mobile, // User mobile number with country code
-                [
-                    'from' => env('TWILIO_NUMBER'), // SMS-enabled Twilio number
-                    'body' => "Your OTP is: $otp. It will expire in 5 minutes."
-                ]
-            );
-        } catch (\Exception $e) {
-            // Handle SMS sending failure
-            return response()->json([
-                'status' => false,
-                'message' => 'OTP sending failed: ' . $e->getMessage()
-            ], 500);
-        }
-
-        // OTP sent successfully
         return response()->json([
             'status' => true,
-            'message' => 'OTP sent to your mobile number'
+            'message' => 'OTP sent successfully',
+            'otp' => $otp,
+            'expires_in' => 5 // minutes, for countdown
         ]);
     }
 
     /**
      * VERIFY OTP
-     * Validates OTP and completes login process
      */
     public function verifyOtp(Request $request)
     {
-        // Validate OTP input
         $request->validate([
             'mobile' => 'required|digits:10',
             'otp' => 'required|digits:6',
         ]);
 
-        // Verify OTP and check expiry
-        $user = User::where('mobile', $request->mobile)
-            ->where('otp', $request->otp)
-            ->where('otp_expires_at', '>=', Carbon::now())
-            ->first();
+        $user = User::where('mobile', $request->mobile)->first();
 
-        // If OTP is invalid or expired
         if (!$user) {
             return response()->json([
                 'status' => false,
-                'message' => 'Invalid or expired OTP'
+                'message' => 'User not found'
+            ], 404);
+        }
+
+        // LOCKOUT TIMER: block 15 min after 3 wrong attempts
+        if ($user->otp_attempts >= 3 && $user->otp_locked_until && $user->otp_locked_until > Carbon::now()) {
+            $blockedFor = Carbon::parse($user->otp_locked_until)->diffInMinutes(Carbon::now());
+            return response()->json([
+                'status' => false,
+                'message' => "Account blocked. Try again in $blockedFor minutes"
+            ], 403);
+        }
+
+        if ($user->otp != $request->otp) {
+            $user->increment('otp_attempts');
+
+            // set lockout time if attempts >=3
+            if ($user->otp_attempts >= 3) {
+                $user->otp_locked_until = Carbon::now()->addMinutes(15);
+                $user->save();
+            }
+
+            return response()->json([
+                'status' => false,
+                'message' => 'Invalid OTP'
             ], 401);
         }
 
-        // Clear OTP after successful verification (security best practice)
+        if ($user->otp_expires_at < Carbon::now()) {
+            return response()->json([
+                'status' => false,
+                'message' => 'OTP expired'
+            ], 401);
+        }
+
+        // Reset OTP and attempts
         $user->update([
             'otp' => null,
             'otp_expires_at' => null,
+            'otp_attempts' => 0,
+            'otp_locked_until' => null
         ]);
 
-        // Return login success response
+        // Create token
+        $token = $user->createToken('auth_token')->plainTextToken;
+
+        // Save login history
+        DB::table('login_histories')->insert([
+            'user_id' => $user->id,
+            'ip_address' => $request->ip(),
+            'login_time' => now(),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
         return response()->json([
             'status' => true,
-            'message' => 'Login successful'
+            'message' => 'Login successful',
+            'token' => $token
+        ]);
+    }
+
+    /**
+     * DASHBOARD
+     */
+    public function dashboard(Request $request)
+    {
+        $user = $request->user();
+
+        $loginHistories = DB::table('login_histories')
+            ->where('user_id', $user->id)
+            ->orderBy('login_time', 'desc')
+            ->get();
+
+        return response()->json([
+            'status' => true,
+            'user' => $user,
+            'login_history' => $loginHistories
+        ]);
+    }
+
+    /**
+     * LOGOUT (current device)
+     */
+    public function logout(Request $request)
+    {
+        $request->user()->tokens()->delete();
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Logged out successfully'
+        ]);
+    }
+
+    /**
+     * LOGOUT ALL DEVICES
+     */
+    public function logoutAll(Request $request)
+    {
+        $request->user()->tokens()->delete(); // all tokens
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Logged out from all devices successfully'
         ]);
     }
 }

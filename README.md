@@ -731,4 +731,7 @@ Use your Twilio SMS-enabled number for sending OTP.
 
 Your PHP_Laravel12_Login_With_OTP Project is Now Ready!
 
+<<<<<<< HEAD
 
+=======
+>>>>>>> development
