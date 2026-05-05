@@ -1,18 +1,16 @@
 <?php
 
 namespace App\Models;
-use Laravel\Sanctum\HasApiTokens;
 
+use Laravel\Sanctum\HasApiTokens;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
 
 // User model represents the 'users' table in the database
 class User extends Authenticatable
 {
-    // Enables notification features (SMS, email, etc.)
-    use Notifiable;
-    use HasApiTokens;
-
+    // Enables API token generation (Sanctum) and notification features
+    use HasApiTokens, Notifiable;
 
     /**
      * The attributes that are mass assignable.
@@ -24,6 +22,8 @@ class User extends Authenticatable
         'password',         // Encrypted user password
         'otp',              // One-Time Password for login verification
         'otp_expires_at',   // OTP expiry timestamp
+        'otp_attempts',     // Number of wrong OTP attempts (New Feature)
+        'otp_locked_until', // Account lockout timestamp (New Feature)
     ];
 
     /**
@@ -33,5 +33,15 @@ class User extends Authenticatable
     protected $hidden = [
         'password', // Hide password from API output
         'otp',      // Hide OTP from API output
+    ];
+
+    /**
+     * The attributes that should be cast to native types.
+     * This automatically converts string dates to Carbon Date instances.
+     */
+    protected $casts = [
+        'otp_expires_at' => 'datetime',
+        'otp_locked_until' => 'datetime',
+        'otp_attempts' => 'integer',
     ];
 }
