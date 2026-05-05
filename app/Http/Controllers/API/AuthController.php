@@ -8,12 +8,32 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\DB;
 use Carbon\Carbon;
+use Twilio\Rest\Client;
+use Illuminate\Support\Facades\Log;
 
 class AuthController extends Controller
 {
-    /**
-     * REGISTER (mobile-based)
-     */
+    private function sendTwilioSms($mobile, $otp)
+    {
+        try {
+            $sid = env('TWILIO_SID');
+            $token = env('TWILIO_AUTH_TOKEN');
+            $from = env('TWILIO_PHONE_NUMBER');
+            $to = "+91" . $mobile;
+
+            $client = new Client($sid, $token);
+            $client->messages->create($to, [
+                'from' => $from,
+                'body' => "Your login OTP is $otp. It will expire in 5 minutes."
+            ]);
+
+            return true;
+        } catch (\Exception $e) {
+            Log::error("Twilio Error: " . $e->getMessage());
+            return false;
+        }
+    }
+
     public function register(Request $request)
     {
         $request->validate([
@@ -24,7 +44,7 @@ class AuthController extends Controller
         $user = User::create([
             'name' => $request->name,
             'mobile' => $request->mobile,
-            'password' => Hash::make('123456'), // default password
+            'password' => Hash::make('123456'),
         ]);
 
         return response()->json([
@@ -33,9 +53,6 @@ class AuthController extends Controller
         ]);
     }
 
-    /**
-     * LOGIN → SEND OTP
-     */
     public function login(Request $request)
     {
         $request->validate([
@@ -51,7 +68,14 @@ class AuthController extends Controller
             ], 404);
         }
 
-        // Generate OTP
+        if ($user->otp_attempts >= 3 && $user->otp_locked_until && $user->otp_locked_until > Carbon::now()) {
+            $blockedFor = Carbon::parse($user->otp_locked_until)->diffInMinutes(Carbon::now());
+            return response()->json([
+                'status' => false,
+                'message' => "Account blocked. Try again in $blockedFor minutes"
+            ], 403);
+        }
+
         $otp = rand(100000, 999999);
 
         $user->update([
@@ -60,17 +84,48 @@ class AuthController extends Controller
             'otp_attempts' => 0
         ]);
 
+        $this->sendTwilioSms($request->mobile, $otp);
+
         return response()->json([
             'status' => true,
-            'message' => 'OTP sent successfully',
-            'otp' => $otp,
-            'expires_in' => 5 // minutes, for countdown
+            'message' => 'OTP sent successfully to your mobile'
         ]);
     }
 
-    /**
-     * VERIFY OTP
-     */
+    public function resendOtp(Request $request)
+    {
+        $request->validate([
+            'mobile' => 'required|digits:10',
+        ]);
+
+        $user = User::where('mobile', $request->mobile)->first();
+
+        if (!$user) {
+            return response()->json(['status' => false, 'message' => 'User not found'], 404);
+        }
+
+        if ($user->updated_at && Carbon::parse($user->updated_at)->diffInSeconds(Carbon::now()) < 60) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Please wait 60 seconds before requesting a new OTP'
+            ], 429);
+        }
+
+        $otp = rand(100000, 999999);
+
+        $user->update([
+            'otp' => $otp,
+            'otp_expires_at' => Carbon::now()->addMinutes(5),
+        ]);
+
+        $this->sendTwilioSms($request->mobile, $otp);
+
+        return response()->json([
+            'status' => true,
+            'message' => 'New OTP sent successfully'
+        ]);
+    }
+
     public function verifyOtp(Request $request)
     {
         $request->validate([
@@ -81,44 +136,28 @@ class AuthController extends Controller
         $user = User::where('mobile', $request->mobile)->first();
 
         if (!$user) {
-            return response()->json([
-                'status' => false,
-                'message' => 'User not found'
-            ], 404);
+            return response()->json(['status' => false, 'message' => 'User not found'], 404);
         }
 
-        // LOCKOUT TIMER: block 15 min after 3 wrong attempts
         if ($user->otp_attempts >= 3 && $user->otp_locked_until && $user->otp_locked_until > Carbon::now()) {
-            $blockedFor = Carbon::parse($user->otp_locked_until)->diffInMinutes(Carbon::now());
-            return response()->json([
-                'status' => false,
-                'message' => "Account blocked. Try again in $blockedFor minutes"
-            ], 403);
+            return response()->json(['status' => false, 'message' => 'Account blocked temporarily'], 403);
         }
 
         if ($user->otp != $request->otp) {
             $user->increment('otp_attempts');
 
-            // set lockout time if attempts >=3
             if ($user->otp_attempts >= 3) {
                 $user->otp_locked_until = Carbon::now()->addMinutes(15);
                 $user->save();
             }
 
-            return response()->json([
-                'status' => false,
-                'message' => 'Invalid OTP'
-            ], 401);
+            return response()->json(['status' => false, 'message' => 'Invalid OTP'], 401);
         }
 
         if ($user->otp_expires_at < Carbon::now()) {
-            return response()->json([
-                'status' => false,
-                'message' => 'OTP expired'
-            ], 401);
+            return response()->json(['status' => false, 'message' => 'OTP expired'], 401);
         }
 
-        // Reset OTP and attempts
         $user->update([
             'otp' => null,
             'otp_expires_at' => null,
@@ -126,13 +165,12 @@ class AuthController extends Controller
             'otp_locked_until' => null
         ]);
 
-        // Create token
         $token = $user->createToken('auth_token')->plainTextToken;
 
-        // Save login history
         DB::table('login_histories')->insert([
             'user_id' => $user->id,
             'ip_address' => $request->ip(),
+            'user_agent' => $request->userAgent(),
             'login_time' => now(),
             'created_at' => now(),
             'updated_at' => now(),
@@ -145,9 +183,6 @@ class AuthController extends Controller
         ]);
     }
 
-    /**
-     * DASHBOARD
-     */
     public function dashboard(Request $request)
     {
         $user = $request->user();
@@ -164,29 +199,15 @@ class AuthController extends Controller
         ]);
     }
 
-    /**
-     * LOGOUT (current device)
-     */
     public function logout(Request $request)
     {
         $request->user()->tokens()->delete();
-
-        return response()->json([
-            'status' => true,
-            'message' => 'Logged out successfully'
-        ]);
+        return response()->json(['status' => true, 'message' => 'Logged out successfully']);
     }
 
-    /**
-     * LOGOUT ALL DEVICES
-     */
     public function logoutAll(Request $request)
     {
-        $request->user()->tokens()->delete(); // all tokens
-
-        return response()->json([
-            'status' => true,
-            'message' => 'Logged out from all devices successfully'
-        ]);
+        $request->user()->tokens()->delete();
+        return response()->json(['status' => true, 'message' => 'Logged out from all devices']);
     }
 }
